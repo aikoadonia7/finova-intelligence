@@ -1,120 +1,54 @@
-import os
-from dotenv import load_dotenv
-from groq import Groq
-import pandas as pd
-import plotly.express as px
-import streamlit as st
+if uploaded_file is not None:
+    df = pd.read_excel(uploaded_file)
 
-# Load API key securely
-load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-  st.error(
-      "🚨 API Key is missing! Set it in Streamlit Secrets or a .env file."
-  )
-  st.stop()
+    required_cols = {"Category", "Budget", "Actual"}
+    if not required_cols.issubset(df.columns):
+        st.error(f"Kolom wajib harus ada: {', '.join(sorted(required_cols))}")
+        st.stop()
 
-# Streamlit App UI
-st.set_page_config(
-    page_title="Budget vs. Actuals AI", page_icon="📊", layout="wide"
-)
-st.title("📊 Budget vs. Actuals AI – Variance Analysis & Commentary")
-st.write(
-    "Upload your Budget vs. Actuals file and get AI-driven financial"
-    " insights!"
-)
-
-# File uploader
-uploaded_file = st.file_uploader(
-    "📂 Upload your dataset (Excel format)", type=["xlsx"]
-)
-if uploaded_file:
-  # Read the Excel file
-  df = pd.read_excel(uploaded_file)
-  # Check for required columns
-  required_columns = ["Category", "Budget", "Actual"]
-  if not all(col in df.columns for col in required_columns):
-    st.error(
-        "⚠️ The uploaded file must contain 'Category', 'Budget', and"
-        " 'Actual' columns!"
+    df["Budget"] = pd.to_numeric(df["Budget"], errors="coerce").fillna(0)
+    df["Actual"] = pd.to_numeric(df["Actual"], errors="coerce").fillna(0)
+    df["Variance"] = df["Actual"] - df["Budget"]
+    df["Variance_Pct"] = df.apply(
+        lambda r: ((r["Actual"] - r["Budget"]) / r["Budget"] * 100) if r["Budget"] != 0 else 0.0,
+        axis=1,
     )
-    st.stop()
-
-  # Calculate Variance and Variance Percentage
-  df["Variance"] = df["Actual"] - df["Budget"]
-  df["Variance %"] = (df["Variance"] / df["Budget"]) * 100
-
-  # Display data preview
-  st.subheader("📊 Data Preview with Variance Calculation")
-  st.dataframe(df)
-
-  # Plot Variance Analysis
-  st.subheader("📈 Budget vs. Actual Variance Analysis")
-
-  fig_bar = px.bar(
-      df,
-      x="Category",
-      y="Variance",
-      color="Variance",
-      title="📊 Variance by Category",
-      text_auto=".2s",
-      color_continuous_scale=["red", "yellow", "green"],
-  )
-  st.plotly_chart(fig_bar)
-
-  fig_line = px.line(
-      df,
-      x="Category",
-      y=["Budget", "Actual"],
-      markers=True,
-      title="📉 Budget vs. Actual Performance",
-  )
-  st.plotly_chart(fig_line)
-
-  # AI Section
-  st.subheader("🤖 AI-Powered Variance Analysis")
-  # AI Summary of Variance Data
-  client = Groq(api_key=GROQ_API_KEY)
-  response = client.chat.completions.create(
-      messages=[
-          {
-              "role": "system",
-              "content": (
-                  "You are an AI financial analyst providing variance"
-                  " analysis insights on budget vs. actuals."
-              ),
-          },
-          {
-              "role": "user",
-              "content": (
-                  "Here is the budget vs. actual variance"
-                  f" summary:\n{df.to_string()}\nWhat are the key insights"
-                  " and recommendations?"
-              ),
-          },
-      ],
-      model="llama-3.1-8b-instant",
-  )
-  st.write(response.choices[0].message.content)
-
-  # AI Chat - Users Can Ask Questions
-  st.subheader("🗣️ Chat with AI About Variance Analysis")
-  user_query = st.text_input("🔍 Ask the AI about your variance data:")
-  if user_query:
-    chat_response = client.chat.completions.create(
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an AI financial analyst helping users"
-                    " understand their budget vs. actual variance analysis."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Variance Data:\n{df.to_string()}\n{user_query}",
-            },
-        ],
-        model="llama-3.1-8b-instant",
+    df["Status"] = df["Variance"].apply(
+        lambda v: "Over Budget" if v > 0 else ("Under Budget" if v < 0 else "On Budget")
     )
-    st.write(chat_response.choices[0].message.content)
+
+    total_budget = df["Budget"].sum()
+    total_actual = df["Actual"].sum()
+    total_variance = total_actual - total_budget
+    total_var_pct = (total_variance / total_budget * 100) if total_budget != 0 else 0.0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Budget", f"{total_budget:,.2f}")
+    c2.metric("Total Actual", f"{total_actual:,.2f}")
+    c3.metric("Total Variance", f"{total_variance:+,.2f}", f"{total_var_pct:+.2f}%")
+
+    st.subheader("Ringkasan Tabel Varians")
+    st.dataframe(df, use_container_width=True)
+
+    st.subheader("Perbandingan Budget vs. Actual")
+    df_melted = df.melt(id_vars="Category", value_vars=["Budget", "Actual"], var_name="Type", value_name="Amount")
+    fig = px.bar(df_melted, x="Category", y="Amount", color="Type", barmode="group")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Komentar & Insight AI (Groq)")
+    if st.button("Generate AI Commentary"):
+        client = Groq(api_key=GROQ_API_KEY)
+        summary_text = df[["Category", "Budget", "Actual", "Variance", "Variance_Pct", "Status"]].to_string(index=False)
+        prompt = (
+            "Kamu adalah analis keuangan. Berikan ringkasan varians Budget vs. Actual secara singkat, "
+            "jelas, dan actionable dalam bahasa Indonesia berdasarkan data berikut:\n\n"
+            f"Total Budget: {total_budget:,.2f}, Total Actual: {total_actual:,.2f}, Total Variance: {total_variance:+,.2f} ({total_var_pct:+.2f}%)\n"
+            f"{summary_text}"
+        )
+        with st.spinner("Menghasilkan analisis AI..."):
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+        st.markdown(completion.choices[0].message.content)
