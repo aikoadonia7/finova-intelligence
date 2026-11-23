@@ -1,0 +1,333 @@
+import io
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from docx import Document
+from groq import Groq
+from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import LinearRegression
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+PROMPT_PRESETS = {
+    "Ringkasan Eksekutif (gaya CEO)": "Buat ringkasan eksekutif singkat untuk CEO: kondisi arus kas, 3 temuan utama, dan 1 keputusan yang perlu diambil.",
+    "Audit & cari pemborosan biaya": "Audit data pengeluaran. Identifikasi kategori yang boros atau tidak wajar dan jelaskan alasannya berdasarkan angka.",
+    "Rekomendasi strategi bulan depan": "Berikan 3 rekomendasi strategi keuangan untuk bulan depan berdasarkan tren, anomali, dan hasil forecast.",
+    "Jelaskan penyebab anomali": "Jelaskan kemungkinan penyebab anomali yang terdeteksi dan langkah verifikasi yang sebaiknya dilakukan.",
+}
+
+st.set_page_config(page_title="FinSmart Analytics + AI Agent", page_icon="📊", layout="wide")
+
+
+# ---------------------------------------------------------------- data
+def make_template() -> bytes:
+    """Template Excel: sheet 'transaksi' dan sheet 'budget' (opsional)."""
+    trx = pd.DataFrame({
+        "date": ["2026-01-02", "2026-01-03", "2026-01-05", "2026-01-08"],
+        "amount": [5000000, 750000, 1200000, 300000],
+        "category": ["Penjualan", "Marketing", "Gaji", "Operasional"],
+        "type": ["income", "expense", "expense", "expense"],
+    })
+    budget = pd.DataFrame({
+        "category": ["Marketing", "Gaji", "Operasional"],
+        "budget": [1000000, 1200000, 500000],
+    })
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        trx.to_excel(w, sheet_name="transaksi", index=False)
+        budget.to_excel(w, sheet_name="budget", index=False)
+    return buf.getvalue()
+
+
+def read_any(file, sheet=None) -> pd.DataFrame:
+    if file.name.lower().endswith(".csv"):
+        return pd.read_csv(file)
+    return pd.read_excel(file, sheet_name=sheet or 0)
+
+
+@st.cache_data(show_spinner=False)
+def load_data(file_bytes: bytes, name: str) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    bio = io.BytesIO(file_bytes)
+    bio.name = name
+    if name.lower().endswith(".csv"):
+        df, budget = pd.read_csv(bio), None
+    else:
+        xl = pd.ExcelFile(bio)
+        df = xl.parse(xl.sheet_names[0])
+        budget = xl.parse("budget") if "budget" in xl.sheet_names else None
+
+    df.columns = [c.strip().lower() for c in df.columns]
+    missing = {"date", "amount", "category"} - set(df.columns)
+    if missing:
+        raise ValueError(f"Kolom wajib tidak ditemukan: {', '.join(sorted(missing))}")
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df = df.dropna(subset=["date", "amount"]).copy()
+
+    if "type" in df.columns:
+        is_exp = df["type"].astype(str).str.lower().isin(["expense", "pengeluaran"])
+        df["signed"] = np.where(is_exp, -df["amount"].abs(), df["amount"].abs())
+    else:  # tanpa kolom type: positif = pemasukan, negatif = pengeluaran
+        df["signed"] = df["amount"]
+
+    if budget is not None:
+        budget.columns = [c.strip().lower() for c in budget.columns]
+        if not {"category", "budget"} <= set(budget.columns):
+            budget = None
+    return df, budget
+
+
+def daily_series(df: pd.DataFrame) -> pd.Series:
+    s = df.groupby(df["date"].dt.normalize())["signed"].sum()
+    return s.reindex(pd.date_range(s.index.min(), s.index.max()), fill_value=0)
+
+
+# ---------------------------------------------------------- analytics
+def zscore_anomalies(daily: pd.Series, thr: float) -> pd.DataFrame:
+    std = daily.std()
+    if std == 0 or np.isnan(std):
+        return pd.DataFrame(columns=["date", "net", "zscore"])
+    z = (daily - daily.mean()) / std
+    out = pd.DataFrame({"date": daily.index, "net": daily.values, "zscore": z.values})
+    return out[out["zscore"].abs() > thr].reset_index(drop=True)
+
+
+def iforest_anomalies(df: pd.DataFrame, contamination: float) -> pd.DataFrame:
+    if len(df) < 10:
+        return df.iloc[0:0]
+    model = IsolationForest(contamination=contamination, random_state=42)
+    flag = model.fit_predict(df[["signed"]])
+    return df[flag == -1].sort_values("signed")
+
+
+def forecast(daily: pd.Series, horizon: int) -> pd.DataFrame:
+    x = np.arange(len(daily)).reshape(-1, 1)
+    lr = LinearRegression().fit(x, daily.values)
+    fx = np.arange(len(daily), len(daily) + horizon).reshape(-1, 1)
+    idx = pd.date_range(daily.index[-1] + pd.Timedelta(days=1), periods=horizon)
+    return pd.DataFrame({"forecast_net": lr.predict(fx)}, index=idx)
+
+
+def variance_table(df: pd.DataFrame, budget: pd.DataFrame | None) -> pd.DataFrame | None:
+    if budget is None:
+        return None
+    actual = (-df[df["signed"] < 0].groupby("category")["signed"].sum()).rename("actual")
+    t = budget.set_index("category").join(actual, how="outer").fillna(0)
+    t["variance"] = t["actual"] - t["budget"]
+    t["variance_pct"] = np.where(t["budget"] != 0, t["variance"] / t["budget"] * 100, np.nan)
+    return t.reset_index().sort_values("variance_pct", ascending=False)
+
+
+def build_context(df, daily, income, expense, z_df, if_df, var_df, fc) -> str:
+    cat = df.groupby("category")["signed"].sum().sort_values().round(0).to_dict()
+    parts = [
+        f"Periode: {daily.index.min().date()} s/d {daily.index.max().date()} ({len(daily)} hari)",
+        f"Total pemasukan: {income:,.0f} | Total pengeluaran: {expense:,.0f} | Net: {income - expense:,.0f}",
+        f"Net per kategori: {cat}",
+        f"Anomali Z-Score (hari): {z_df.head(5).to_dict('records')}",
+        f"Anomali Isolation Forest (transaksi): {if_df.head(5)[['date', 'category', 'signed']].astype(str).to_dict('records')}",
+        f"Rata-rata forecast net harian: {fc['forecast_net'].mean():,.0f}",
+    ]
+    if var_df is not None:
+        parts.append(f"Variance vs budget: {var_df.round(1).to_dict('records')}")
+    return "\n".join(parts)
+
+
+# ------------------------------------------------------------------ AI
+def get_client() -> Groq | None:
+    try:
+        key = st.secrets["GROQ_API_KEY"]
+    except Exception:  # secrets belum diatur sama sekali
+        return None
+    return Groq(api_key=key) if key else None
+
+
+def ask_llm(client: Groq, messages: list[dict]) -> str:
+    resp = client.chat.completions.create(model=GROQ_MODEL, messages=messages, temperature=0.3)
+    return resp.choices[0].message.content
+
+
+def system_prompt(context: str) -> str:
+    return (
+        "Anda adalah analis keuangan (FP&A) yang menjawab dalam Bahasa Indonesia, ringkas, "
+        "berbasis angka. Jangan mengarang data di luar konteks berikut.\n\n" + context
+    )
+
+
+# -------------------------------------------------------------- export
+def export_excel(summary, daily, z_df, if_df, var_df, commentary) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame(summary.items(), columns=["metrik", "nilai"]).to_excel(w, sheet_name="ringkasan", index=False)
+        daily.rename("net").reset_index(names="date").to_excel(w, sheet_name="harian", index=False)
+        z_df.to_excel(w, sheet_name="anomali_zscore", index=False)
+        if_df.to_excel(w, sheet_name="anomali_iforest", index=False)
+        if var_df is not None:
+            var_df.to_excel(w, sheet_name="variance", index=False)
+        pd.DataFrame({"AI Commentary": [commentary or "-"]}).to_excel(w, sheet_name="ai_commentary", index=False)
+    return buf.getvalue()
+
+
+def export_word(summary, z_df, var_df, commentary) -> bytes:
+    doc = Document()
+    doc.add_heading("Laporan FinSmart Analytics", 0)
+    doc.add_heading("Ringkasan", 1)
+    for k, v in summary.items():
+        doc.add_paragraph(f"{k}: {v}", style="List Bullet")
+    doc.add_heading("Anomali Harian (Z-Score)", 1)
+    doc.add_paragraph(z_df.head(10).to_string(index=False) if len(z_df) else "Tidak ada anomali.")
+    if var_df is not None:
+        doc.add_heading("Variance vs Budget", 1)
+        doc.add_paragraph(var_df.round(1).to_string(index=False))
+    doc.add_heading("Komentar AI", 1)
+    doc.add_paragraph(commentary or "Belum ada komentar AI.")
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------------ UI
+st.title("📊 FinSmart Analytics + FP&A AI Agent")
+
+with st.sidebar:
+    st.header("⚙️ Pengaturan")
+    st.download_button("⬇️ Download contoh template Excel", make_template(),
+                       "template_finsmart.xlsx",
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    uploaded = st.file_uploader("Upload data (xlsx / xls / csv)", type=["xlsx", "xls", "csv"])
+    z_thr = st.slider("Ambang Z-Score", 1.5, 4.0, 2.5, 0.1)
+    contamination = st.slider("Contamination (Isolation Forest)", 0.01, 0.20, 0.05, 0.01)
+    horizon = st.slider("Horizon forecast (hari)", 7, 90, 30)
+    var_thr = st.slider("Alert variance budget (%)", 5, 50, 15)
+
+    st.divider()
+    st.subheader("🎛️ What-If Simulator")
+    rev_up = st.slider("Perubahan pemasukan (%)", -30, 30, 0)
+    cost_down = st.slider("Efisiensi biaya (%)", -30, 30, 0)
+
+if uploaded is None:
+    st.info("Upload file transaksi (kolom minimal: date, amount, category) atau unduh template di sidebar.")
+    st.stop()
+
+try:
+    df, budget = load_data(uploaded.getvalue(), uploaded.name)
+except Exception as e:  # noqa: BLE001
+    st.error(f"Gagal membaca file: {e}")
+    st.stop()
+
+daily = daily_series(df)
+income = df.loc[df["signed"] > 0, "signed"].sum()
+expense = -df.loc[df["signed"] < 0, "signed"].sum()
+z_df = zscore_anomalies(daily, z_thr)
+if_df = iforest_anomalies(df, contamination)
+var_df = variance_table(df, budget)
+fc = forecast(daily, horizon)
+context = build_context(df, daily, income, expense, z_df, if_df, var_df, fc)
+
+# --- Alert otomatis (rule-based, sebelum LLM)
+alerts = []
+if var_df is not None:
+    over = var_df[var_df["variance_pct"] > var_thr]
+    alerts += [f"**{r.category}** melebihi budget {r.variance_pct:.0f}%" for r in over.itertuples()]
+if len(z_df):
+    alerts.append(f"{len(z_df)} hari dengan arus kas menyimpang (Z-Score > {z_thr})")
+if alerts:
+    st.error("🚨 **Alert Otomatis**\n\n" + "\n".join(f"- {a}" for a in alerts[:3]))
+
+# --- Metrik
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total Income", f"{income:,.0f}")
+c2.metric("Total Expense", f"{expense:,.0f}")
+c3.metric("Net Cashflow", f"{income - expense:,.0f}")
+c4.metric("Rentang Hari", len(daily))
+
+tab_viz, tab_anom, tab_fc, tab_sim, tab_ai = st.tabs(
+    ["📈 Visualisasi", "🕵️ Anomali", "🔮 Forecast", "🎛️ Simulasi", "🤖 AI Analyst"])
+
+with tab_viz:
+    st.subheader("Arus kas harian")
+    st.line_chart(daily)
+    st.subheader("Net per kategori")
+    st.bar_chart(df.groupby("category")["signed"].sum())
+    if var_df is not None:
+        st.subheader("Actual vs Budget")
+        st.dataframe(var_df.round(1), use_container_width=True)
+
+with tab_anom:
+    st.subheader("Z-Score (harian)")
+    st.dataframe(z_df, use_container_width=True)
+    st.subheader("Isolation Forest (transaksi)")
+    st.dataframe(if_df, use_container_width=True)
+
+with tab_fc:
+    st.line_chart(pd.concat([daily.rename("historis"), fc["forecast_net"].rename("forecast")], axis=1))
+    st.caption("Model: regresi linear sederhana. Untuk pola musiman, pertimbangkan Prophet/SARIMA.")
+
+with tab_sim:
+    sim_income = income * (1 + rev_up / 100)
+    sim_expense = expense * (1 - cost_down / 100)
+    a, b, c = st.columns(3)
+    a.metric("Income (skenario)", f"{sim_income:,.0f}", f"{sim_income - income:,.0f}")
+    b.metric("Expense (skenario)", f"{sim_expense:,.0f}", f"{sim_expense - expense:,.0f}", delta_color="inverse")
+    c.metric("Net (skenario)", f"{sim_income - sim_expense:,.0f}",
+             f"{(sim_income - sim_expense) - (income - expense):,.0f}")
+    sim_text = (f"Skenario: pemasukan {rev_up:+d}%, efisiensi biaya {cost_down:+d}%. "
+                f"Net baseline {income - expense:,.0f} -> skenario {sim_income - sim_expense:,.0f}.")
+    if st.button("Minta AI evaluasi skenario ini"):
+        client = get_client()
+        if client is None:
+            st.warning("GROQ_API_KEY belum diatur di secrets.")
+        else:
+            with st.spinner("AI menganalisis..."):
+                st.session_state["sim_eval"] = ask_llm(client, [
+                    {"role": "system", "content": system_prompt(context)},
+                    {"role": "user", "content": sim_text + " Nilai risiko dan kelayakan asumsi ini."}])
+    if "sim_eval" in st.session_state:
+        st.write(st.session_state["sim_eval"])
+
+with tab_ai:
+    client = get_client()
+    if client is None:
+        st.warning("Tambahkan GROQ_API_KEY di `.streamlit/secrets.toml` atau Secrets Streamlit Cloud.")
+    else:
+        preset = st.selectbox("Preset prompt", list(PROMPT_PRESETS))
+        if st.button("Generate komentar AI"):
+            with st.spinner("AI menganalisis..."):
+                st.session_state["commentary"] = ask_llm(client, [
+                    {"role": "system", "content": system_prompt(context)},
+                    {"role": "user", "content": PROMPT_PRESETS[preset]}])
+        if st.session_state.get("commentary"):
+            st.markdown(st.session_state["commentary"])
+
+        st.divider()
+        st.subheader("💬 Chat dengan data keuangan Anda")
+        st.session_state.setdefault("chat", [])
+        for m in st.session_state["chat"]:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+        if q := st.chat_input("Tanya apa saja, mis. 'Kenapa pengeluaran Marketing naik?'"):
+            st.session_state["chat"].append({"role": "user", "content": q})
+            with st.chat_message("user"):
+                st.markdown(q)
+            msgs = [{"role": "system", "content": system_prompt(context)}] + st.session_state["chat"][-10:]
+            with st.chat_message("assistant"):
+                with st.spinner("Berpikir..."):
+                    ans = ask_llm(client, msgs)
+                st.markdown(ans)
+            st.session_state["chat"].append({"role": "assistant", "content": ans})
+
+# --- Ekspor
+st.divider()
+st.subheader("📤 Ekspor Laporan")
+summary = {"Total Income": f"{income:,.0f}", "Total Expense": f"{expense:,.0f}",
+           "Net Cashflow": f"{income - expense:,.0f}", "Rentang Hari": len(daily)}
+commentary = st.session_state.get("commentary", "")
+e1, e2 = st.columns(2)
+e1.download_button("⬇️ Excel", export_excel(summary, daily, z_df, if_df, var_df, commentary),
+                   "laporan_finsmart.xlsx",
+                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+e2.download_button("⬇️ Word", export_word(summary, z_df, var_df, commentary),
+                   "laporan_finsmart.docx",
+                   "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
