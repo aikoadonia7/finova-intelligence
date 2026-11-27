@@ -1,2 +1,4 @@
 # finsmart-analytics-web
-Dashboard keuangan dengan AI agent
+AI-Powered Financial Intelligence & Predictive Analytics Platform
+BEYOND FINANCIAL DATA,
+INTO INTELLIGENT DECISIONS.
